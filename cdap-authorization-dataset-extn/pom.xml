@@ -22,7 +22,7 @@
   <parent>
     <groupId>co.cask.cdap</groupId>
     <artifactId>cdap-security-extensions</artifactId>
-    <version>0.6.0-SNAPSHOT_5.1.217</version>
+    <version>0.6.0-SNAPSHOT_5.1.2171</version>
   </parent>
 
   <artifactId>cdap-authorization-dataset-extn</artifactId>
@@ -31,7 +31,7 @@
 
   <properties>
     <security.authorizer.class>co.cask.cdap.security.authorization.DatasetBasedAuthorizer</security.authorizer.class>
-    <guava.version>13.0.1</guava.version>
+    <guava.version>28.0-jre</guava.version>
   </properties>
 
   <dependencies>
