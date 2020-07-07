@@ -1,21 +1,5 @@
-/*
- * Copyright © 2017 Cask Data, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not
- * use this file except in compliance with the License. You may obtain a copy of
- * the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
- * License for the specific language governing permissions and limitations under
- * the License.
- */
 package co.cask.cdap.security.authorization.ranger.binding;
 
-import co.cask.cdap.common.conf.Constants;
 import co.cask.cdap.proto.element.EntityType;
 import co.cask.cdap.proto.id.ApplicationId;
 import co.cask.cdap.proto.id.ArtifactId;
@@ -34,268 +18,227 @@ import co.cask.cdap.proto.security.Authorizable;
 import co.cask.cdap.proto.security.Principal;
 import co.cask.cdap.proto.security.Privilege;
 import co.cask.cdap.proto.security.Role;
-import co.cask.cdap.security.authorization.ranger.commons.RangerCommon;
+import co.cask.cdap.proto.security.Principal.PrincipalType;
 import co.cask.cdap.security.spi.authorization.AbstractAuthorizer;
 import co.cask.cdap.security.spi.authorization.AuthorizationContext;
-import co.cask.cdap.security.spi.authorization.Authorizer;
 import co.cask.cdap.security.spi.authorization.UnauthorizedException;
 import com.google.common.base.Preconditions;
+import java.net.InetAddress;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Properties;
+import java.util.Set;
+import javax.security.auth.Subject;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.ranger.audit.provider.MiscUtil;
 import org.apache.ranger.plugin.audit.RangerDefaultAuditHandler;
-import org.apache.ranger.plugin.policyengine.RangerAccessRequest;
 import org.apache.ranger.plugin.policyengine.RangerAccessRequestImpl;
 import org.apache.ranger.plugin.policyengine.RangerAccessResourceImpl;
 import org.apache.ranger.plugin.policyengine.RangerAccessResult;
-import org.apache.ranger.plugin.policyengine.RangerPolicyEngine;
+import org.apache.ranger.plugin.policyengine.RangerAccessRequest.ResourceMatchingScope;
 import org.apache.ranger.plugin.service.RangerBasePlugin;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.net.InetAddress;
-import java.util.Date;
-import java.util.HashSet;
-import java.util.Properties;
-import java.util.Set;
-
-/**
- * This class implements {@link Authorizer} from CDAP and is responsible for interacting with Ranger to enforce
- * authorization.
- */
 public class RangerAuthorizer extends AbstractAuthorizer {
-  private static final Logger LOG = LoggerFactory.getLogger(RangerAuthorizer.class);
+   private static final Logger LOG = LoggerFactory.getLogger(RangerAuthorizer.class);
+   private static volatile RangerBasePlugin rangerPlugin = null;
+   private AuthorizationContext context;
+   private String instanceName;
 
-  private static volatile RangerBasePlugin rangerPlugin = null;
-  private AuthorizationContext context;
-  // cdap instance name
-  private String instanceName;
-
-  @Override
-  public synchronized void initialize(AuthorizationContext context) throws Exception {
-    this.context = context;
-    Properties properties = context.getExtensionProperties();
-    instanceName = properties.containsKey(Constants.INSTANCE_NAME) ?
-      properties.getProperty(Constants.INSTANCE_NAME) : "cdap";
-    if (rangerPlugin == null) {
-      UserGroupInformation ugi = UserGroupInformation.getLoginUser();
-      Preconditions.checkNotNull(ugi, "Kerberos login information is not available. UserGroupInformation is null");
-      // set the login user as the user as whom cdap is running as this is needed for kerberos authentication
-      MiscUtil.setUGILoginUser(ugi, null);
-      LOG.debug("Initializing Ranger CDAP Plugin with UGI {}", ugi);
-
-      // the string name here should not be changed as this uniquely identifies the plugin in ranger. If it's
-      // changed it will require changing all the supporting xml file which is in this package.
-      rangerPlugin = new RangerBasePlugin("cdap", "cdap");
-    }
-    rangerPlugin.init();
-    RangerDefaultAuditHandler auditHandler = new RangerDefaultAuditHandler();
-    rangerPlugin.setResultProcessor(auditHandler);
-  }
-
-  @Override
-  public void enforce(EntityId entity, Principal principal, Action action) throws Exception {
-    // for enforcement we do authorization just on the entity in question unlike isVisible where we also
-    // consider privileges on the children
-    if (!enforce(entity, principal, RangerAccessRequest.ResourceMatchingScope.SELF, toRangerAccessType(action))) {
-      throw new UnauthorizedException(principal, action, entity);
-    }
-  }
-
-  @Override
-  public void enforce(EntityId entityId, Principal principal, Set<Action> set) throws Exception {
-    LOG.debug("Enforce called on entity {}, principal {}, actions {}", entityId, principal, set);
-    //TODO: Investigate if its possible to make the enforce call with set of actions rather than one by one
-    for (Action action : set) {
-      enforce(entityId, principal, action);
-    }
-  }
-
-  @Override
-  public Set<? extends EntityId> isVisible(Set<? extends EntityId> entityIds, Principal principal) throws Exception {
-    // for visibility we take bottom up approach i.e. an entity is visible if the the principal has any privilege on
-    // the entity or any of descendants.
-    Set<EntityId> visibleEntities = new HashSet<>(entityIds.size());
-    for (EntityId entityId : entityIds) {
-      if (enforce(entityId, principal, RangerAccessRequest.ResourceMatchingScope.SELF_OR_DESCENDANTS,
-                  RangerPolicyEngine.ANY_ACCESS)) {
-        visibleEntities.add(entityId);
+   public synchronized void initialize(AuthorizationContext context) throws Exception {
+      this.context = context;
+      Properties properties = context.getExtensionProperties();
+      this.instanceName = properties.containsKey("instance.name") ? properties.getProperty("instance.name") : "cdap";
+      if (rangerPlugin == null) {
+         UserGroupInformation ugi = UserGroupInformation.getLoginUser();
+         Preconditions.checkNotNull(ugi, "Kerberos login information is not available. UserGroupInformation is null");
+         MiscUtil.setUGILoginUser(ugi, (Subject)null);
+         LOG.debug("Initializing Ranger CDAP Plugin with UGI {}", ugi);
+         rangerPlugin = new RangerBasePlugin("cdap", "cdap");
       }
-    }
-    return visibleEntities;
-  }
 
-  @Override
-  public void grant(Authorizable authorizable, Principal principal, Set<Action> set) throws Exception {
-    throw new UnsupportedOperationException("Please use Ranger Admin UI to grant privileges.");
-  }
+      rangerPlugin.init();
+      RangerDefaultAuditHandler auditHandler = new RangerDefaultAuditHandler();
+      rangerPlugin.setResultProcessor(auditHandler);
+   }
 
-  @Override
-  public void revoke(Authorizable authorizable, Principal principal, Set<Action> set) throws Exception {
-    throw new UnsupportedOperationException("Please use Ranger Admin UI to revoke privileges.");
-  }
+   public void enforce(EntityId entity, Principal principal, Action action) throws Exception {
+      if (!this.enforce(entity, principal, ResourceMatchingScope.SELF, this.toRangerAccessType(action))) {
+         throw new UnauthorizedException(principal, action, entity);
+      }
+   }
 
-  @Override
-  public void revoke(Authorizable authorizable) throws Exception {
-    throw new UnsupportedOperationException("Please use Ranger Admin UI to revoke privileges.");
-  }
+   public void enforce(EntityId entityId, Principal principal, Set<Action> set) throws Exception {
+      LOG.debug("Enforce called on entity {}, principal {}, actions {}", new Object[]{entityId, principal, set});
+      Iterator var4 = set.iterator();
 
-  @Override
-  public void createRole(Role role) throws Exception {
-    throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
-  }
+      while(var4.hasNext()) {
+         Action action = (Action)var4.next();
+         this.enforce(entityId, principal, action);
+      }
 
-  @Override
-  public void dropRole(Role role) throws Exception {
-    throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
-  }
+   }
 
-  @Override
-  public void addRoleToPrincipal(Role role, Principal principal) throws Exception {
-    throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
+   public Set<? extends EntityId> isVisible(Set<? extends EntityId> entityIds, Principal principal) throws Exception {
+      Set<EntityId> visibleEntities = new HashSet(entityIds.size());
+      Iterator var4 = entityIds.iterator();
 
-  }
+      while(var4.hasNext()) {
+         EntityId entityId = (EntityId)var4.next();
+         if (this.enforce(entityId, principal, ResourceMatchingScope.SELF_OR_DESCENDANTS, "_any")) {
+            visibleEntities.add(entityId);
+         }
+      }
 
-  @Override
-  public void removeRoleFromPrincipal(Role role, Principal principal) throws Exception {
-    throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
+      return visibleEntities;
+   }
 
-  }
+   public void grant(Authorizable authorizable, Principal principal, Set<Action> set) throws Exception {
+      throw new UnsupportedOperationException("Please use Ranger Admin UI to grant privileges.");
+   }
 
-  @Override
-  public Set<Role> listRoles(Principal principal) throws Exception {
-    throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
-  }
+   public void revoke(Authorizable authorizable, Principal principal, Set<Action> set) throws Exception {
+      throw new UnsupportedOperationException("Please use Ranger Admin UI to revoke privileges.");
+   }
 
-  @Override
-  public Set<Role> listAllRoles() throws Exception {
-    throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
-  }
+   public void revoke(Authorizable authorizable) throws Exception {
+      throw new UnsupportedOperationException("Please use Ranger Admin UI to revoke privileges.");
+   }
 
-  @Override
-  public Set<Privilege> listPrivileges(Principal principal) throws Exception {
-    throw new UnsupportedOperationException("Please use Ranger Admin UI to list privileges.");
-  }
+   public void createRole(Role role) throws Exception {
+      throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
+   }
 
-  private boolean enforce(EntityId entity, Principal principal,
-                          RangerAccessRequest.ResourceMatchingScope resourceMatchingScope, String accessType)
-    throws Exception {
-    LOG.debug("Enforce called on entity {}, principal {}, action {} and match scope {}", entity, principal,
-              accessType, resourceMatchingScope);
-    if (rangerPlugin == null) {
-      throw new RuntimeException("CDAP Ranger Authorizer is not initialized.");
-    }
+   public void dropRole(Role role) throws Exception {
+      throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
+   }
 
-    if (principal.getType() != Principal.PrincipalType.USER) {
-      throw new IllegalArgumentException(String.format("The principal type for current enforcement request is '%s'. " +
-                                                         "Authorization enforcement is only supported for '%s'.",
-                                                       principal.getType(), Principal.PrincipalType.USER));
-    }
-    String requestingUser = principal.getName();
-    String ip = InetAddress.getLocalHost().getHostName();
-    Set<String> userGroups = MiscUtil.getGroupsForRequestUser(requestingUser);
+   public void addRoleToPrincipal(Role role, Principal principal) throws Exception {
+      throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
+   }
 
-    LOG.debug("Requesting user {}, ip {}, requesting user groups {}", requestingUser, ip, userGroups);
+   public void removeRoleFromPrincipal(Role role, Principal principal) throws Exception {
+      throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
+   }
 
-    Date eventTime = new Date();
-    RangerAccessRequestImpl rangerRequest = new RangerAccessRequestImpl();
-    rangerRequest.setUser(requestingUser);
-    rangerRequest.setUserGroups(userGroups);
-    rangerRequest.setClientIPAddress(ip);
-    rangerRequest.setAccessTime(eventTime);
-    rangerRequest.setResourceMatchingScope(resourceMatchingScope);
+   public Set<Role> listRoles(Principal principal) throws Exception {
+      throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
+   }
 
-    RangerAccessResourceImpl rangerResource = new RangerAccessResourceImpl();
-    rangerRequest.setResource(rangerResource);
-    rangerRequest.setAccessType(accessType);
+   public Set<Role> listAllRoles() throws Exception {
+      throw new UnsupportedOperationException("Roles are not supported in Ranger plugin.");
+   }
 
-    setAccessResource(entity, rangerResource);
+   public Set<Privilege> listPrivileges(Principal principal) throws Exception {
+      throw new UnsupportedOperationException("Please use Ranger Admin UI to list privileges.");
+   }
 
-    boolean isAuthorized = false;
-
-    try {
-      RangerAccessResult result = rangerPlugin.isAccessAllowed(rangerRequest);
-      if (result == null) {
-        LOG.warn("Unauthorized: Ranger Plugin returned null for this authorization enforcement.");
-        isAuthorized = false;
+   private boolean enforce(EntityId entity, Principal principal, ResourceMatchingScope resourceMatchingScope, String accessType) throws Exception {
+      LOG.debug("Enforce called on entity {}, principal {}, action {} and match scope {}", new Object[]{entity, principal, accessType, resourceMatchingScope});
+      if (rangerPlugin == null) {
+         throw new RuntimeException("CDAP Ranger Authorizer is not initialized.");
+      } else if (principal.getType() != PrincipalType.USER) {
+         throw new IllegalArgumentException(String.format("The principal type for current enforcement request is '%s'. Authorization enforcement is only supported for '%s'.", principal.getType(), PrincipalType.USER));
       } else {
-        isAuthorized = result.getIsAllowed();
+         String requestingUser = principal.getName();
+         String ip = InetAddress.getLocalHost().getHostName();
+         Set<String> userGroups = MiscUtil.getGroupsForRequestUser(requestingUser);
+         LOG.debug("Requesting user {}, ip {}, requesting user groups {}", new Object[]{requestingUser, ip, userGroups});
+         Date eventTime = new Date();
+         RangerAccessRequestImpl rangerRequest = new RangerAccessRequestImpl();
+         rangerRequest.setUser(requestingUser);
+         rangerRequest.setUserGroups(userGroups);
+         rangerRequest.setClientIPAddress(ip);
+         rangerRequest.setAccessTime(eventTime);
+         rangerRequest.setResourceMatchingScope(resourceMatchingScope);
+         RangerAccessResourceImpl rangerResource = new RangerAccessResourceImpl();
+         rangerRequest.setResource(rangerResource);
+         rangerRequest.setAccessType(accessType);
+         this.setAccessResource(entity, rangerResource);
+         boolean isAuthorized = false;
+
+         try {
+            RangerAccessResult result = rangerPlugin.isAccessAllowed(rangerRequest);
+            if (result == null) {
+               LOG.warn("Unauthorized: Ranger Plugin returned null for this authorization enforcement.");
+               isAuthorized = false;
+            } else {
+               isAuthorized = result.getIsAllowed();
+            }
+         } catch (Throwable var16) {
+            LOG.warn("Error while calling isAccessAllowed(). request {}", rangerRequest, var16);
+            throw var16;
+         } finally {
+            LOG.trace("Ranger Request {}, authorization {}.", rangerRequest, isAuthorized ? "successful" : "failed");
+         }
+
+         return isAuthorized;
       }
-    } catch (Throwable t) {
-      LOG.warn("Error while calling isAccessAllowed(). request {}", rangerRequest, t);
-      throw t;
-    } finally {
-      LOG.trace("Ranger Request {}, authorization {}.", rangerRequest, (isAuthorized ? "successful" : "failed"));
-    }
-    return isAuthorized;
-  }
+   }
 
-  private String toRangerAccessType(Action action) {
-    return action.toString().toLowerCase();
-  }
+   private String toRangerAccessType(Action action) {
+      return action.toString().toLowerCase();
+   }
 
-  /**
-   * Sets the access resource appropriately depending on the given entityId
-   *
-   * @param entityId the entity which needs to be set to
-   * @param rangerAccessResource the {@link RangerAccessResourceImpl} to set the entity values to
-   */
-  private void setAccessResource(EntityId entityId, RangerAccessResourceImpl rangerAccessResource) {
-    EntityType entityType = entityId.getEntityType();
-    switch (entityType) {
+   private void setAccessResource(EntityId entityId, RangerAccessResourceImpl rangerAccessResource) {
+      EntityType entityType = entityId.getEntityType();
+      switch(entityType) {
       case INSTANCE:
-        rangerAccessResource.setValue(RangerCommon.KEY_INSTANCE, ((InstanceId) entityId).getInstance());
-        break;
+         rangerAccessResource.setValue("instance", ((InstanceId)entityId).getInstance());
+         break;
       case NAMESPACE:
-        setAccessResource(new InstanceId(instanceName), rangerAccessResource);
-        rangerAccessResource.setValue(RangerCommon.KEY_NAMESPACE, ((NamespaceId) entityId).getNamespace());
-        break;
+         this.setAccessResource(new InstanceId(this.instanceName), rangerAccessResource);
+         rangerAccessResource.setValue("namespace", ((NamespaceId)entityId).getNamespace());
+         break;
       case ARTIFACT:
-        ArtifactId artifactId = (ArtifactId) entityId;
-        setAccessResource(artifactId.getParent(), rangerAccessResource);
-        rangerAccessResource.setValue(RangerCommon.KEY_ARTIFACT, artifactId.getArtifact());
-        break;
+         ArtifactId artifactId = (ArtifactId)entityId;
+         this.setAccessResource(artifactId.getParent(), rangerAccessResource);
+         rangerAccessResource.setValue("artifact", artifactId.getArtifact());
+         break;
       case APPLICATION:
-        ApplicationId applicationId = (ApplicationId) entityId;
-        setAccessResource(applicationId.getParent(), rangerAccessResource);
-        rangerAccessResource.setValue(RangerCommon.KEY_APPLICATION, applicationId.getApplication());
-        break;
+         ApplicationId applicationId = (ApplicationId)entityId;
+         this.setAccessResource(applicationId.getParent(), rangerAccessResource);
+         rangerAccessResource.setValue("application", applicationId.getApplication());
+         break;
       case DATASET:
-        DatasetId dataset = (DatasetId) entityId;
-        setAccessResource(dataset.getParent(), rangerAccessResource);
-        rangerAccessResource.setValue(RangerCommon.KEY_DATASET, dataset.getDataset());
-        break;
+         DatasetId dataset = (DatasetId)entityId;
+         this.setAccessResource(dataset.getParent(), rangerAccessResource);
+         rangerAccessResource.setValue("dataset", dataset.getDataset());
+         break;
       case DATASET_MODULE:
-        DatasetModuleId datasetModuleId = (DatasetModuleId) entityId;
-        setAccessResource(datasetModuleId.getParent(), rangerAccessResource);
-        rangerAccessResource.setValue(RangerCommon.KEY_DATASET_MODULE, datasetModuleId.getModule());
-        break;
+         DatasetModuleId datasetModuleId = (DatasetModuleId)entityId;
+         this.setAccessResource(datasetModuleId.getParent(), rangerAccessResource);
+         rangerAccessResource.setValue("dataset_module", datasetModuleId.getModule());
+         break;
       case DATASET_TYPE:
-        DatasetTypeId datasetTypeId = (DatasetTypeId) entityId;
-        setAccessResource(datasetTypeId.getParent(), rangerAccessResource);
-        rangerAccessResource.setValue(RangerCommon.KEY_DATASET_TYPE, datasetTypeId.getType());
-        break;
+         DatasetTypeId datasetTypeId = (DatasetTypeId)entityId;
+         this.setAccessResource(datasetTypeId.getParent(), rangerAccessResource);
+         rangerAccessResource.setValue("dataset_type", datasetTypeId.getType());
+         break;
       case STREAM:
-        StreamId streamId = (StreamId) entityId;
-        setAccessResource(streamId.getParent(), rangerAccessResource);
-        rangerAccessResource.setValue(RangerCommon.KEY_STREAM, streamId.getStream());
-        break;
+         StreamId streamId = (StreamId)entityId;
+         this.setAccessResource(streamId.getParent(), rangerAccessResource);
+         rangerAccessResource.setValue("stream", streamId.getStream());
+         break;
       case PROGRAM:
-        ProgramId programId = (ProgramId) entityId;
-        setAccessResource(programId.getParent(), rangerAccessResource);
-        rangerAccessResource.setValue(RangerCommon.KEY_PROGRAM, programId.getType().getPrettyName().toLowerCase() +
-          RangerCommon.RESOURCE_SEPARATOR + programId.getProgram());
-        break;
+         ProgramId programId = (ProgramId)entityId;
+         this.setAccessResource(programId.getParent(), rangerAccessResource);
+         rangerAccessResource.setValue("program", programId.getType().getPrettyName().toLowerCase() + "." + programId.getProgram());
+         break;
       case SECUREKEY:
-        SecureKeyId secureKeyId = (SecureKeyId) entityId;
-        setAccessResource(secureKeyId.getParent(), rangerAccessResource);
-        rangerAccessResource.setValue(RangerCommon.KEY_SECUREKEY, secureKeyId.getName());
-        break;
+         SecureKeyId secureKeyId = (SecureKeyId)entityId;
+         this.setAccessResource(secureKeyId.getParent(), rangerAccessResource);
+         rangerAccessResource.setValue("secure_key", secureKeyId.getName());
+         break;
       case KERBEROSPRINCIPAL:
-        setAccessResource(new InstanceId(instanceName), rangerAccessResource);
-        rangerAccessResource.setValue(RangerCommon.KEY_PRINCIPAL, ((KerberosPrincipalId) entityId).getPrincipal());
-        break;
+         this.setAccessResource(new InstanceId(this.instanceName), rangerAccessResource);
+         rangerAccessResource.setValue("principal", ((KerberosPrincipalId)entityId).getPrincipal());
+         break;
       default:
-        throw new IllegalArgumentException(String.format("The entity %s is of unknown type %s", entityId, entityType));
-    }
-  }
+         throw new IllegalArgumentException(String.format("The entity %s is of unknown type %s", entityId, entityType));
+      }
+
+   }
 }
